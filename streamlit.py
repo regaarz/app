@@ -1,284 +1,145 @@
-from flask import Flask, render_template_string, request
+import streamlit as st
+import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, db
-import sqlite3
-import threading
-import time
+import hashlib
+import json
 import os
-import math
 
-# ======================
-# APP INIT
-# ======================
-app = Flask(__name__)
+# ===============================
+# KONFIGURASI
+# ===============================
+DATABASE_URL = "https://tongsampah-fb84c-default-rtdb.firebaseio.com/"
+BUCKETS = ["Tongsampah1", "Tongsampah2", "Tongsampah3"]
+PAGE_SIZE = 10
+REFRESH_SEC = 10
 
-# ======================
-# PATH DATABASE
-# ======================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "tongsampah.db")
+# ===============================
+# FIREBASE INIT DARI ENV
+# ===============================
+if not firebase_admin._apps:
+    cred_dict = json.loads(os.environ["FIREBASE_KEY"])
+    cred = credentials.Certificate(cred_dict)
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": DATABASE_URL
+    })
 
-# ======================
-# FIREBASE INIT
-# ======================
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://tongsampah-fb84c-default-rtdb.firebaseio.com/"
-})
+# ===============================
+# BACA DATA DARI FIREBASE
+# ===============================
+def read_current_data():
+    rows = []
 
-# ======================
-# SQLITE INIT
-# ======================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS data_tongsampah (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tong_id INTEGER,
-            organik INTEGER,
-            anorganik INTEGER,
-            b3 INTEGER,
-            timestamp INTEGER,
-            waktu TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    for bucket in BUCKETS:
+        v = db.reference(bucket).get()
+        if not isinstance(v, dict):
+            continue
 
-init_db()
+        def to_int(val):
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return 0
 
-# ======================
-# MAP TONG → ID
-# ======================
-TONG_MAP = {
-    "Tongsampah1": 1,
-    "Tongsampah2": 2,
-    "Tongsampah3": 3
-}
+        rows.append({
+            "tong_id": v.get("tong_id"),
+            "organik": to_int(v.get("organik")),
+            "anorganik": to_int(v.get("anorganik")),
+            "b3": to_int(v.get("b3")),
+            "waktu": v.get("waktu"),
+            "source": bucket
+        })
+    return rows
 
-# ======================
-# KONVERSI % → INT
-# ======================
-def persen_ke_int(value):
-    try:
-        if value is None:
-            return 0
-        if isinstance(value, str):
-            return int(value.replace("%", "").strip())
-        return int(value)
-    except:
-        return 0
+# ===============================
+# HASH UNTUK DETEKSI PERUBAHAN
+# ===============================
+def row_hash(row):
+    s = f"{row['tong_id']}-{row['organik']}-{row['anorganik']}-{row['b3']}-{row['waktu']}"
+    return hashlib.md5(s.encode()).hexdigest()
 
-# ======================
-# SIMPAN KE SQLITE
-# ======================
-def simpan_ke_db(tong_id, data):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+# ===============================
+# STREAMLIT UI
+# ===============================
+st.set_page_config(page_title="Monitoring Tong Sampah", layout="wide")
+st.title("📊 Monitoring Tong Sampah (Append Row Mode)")
 
-    organik = persen_ke_int(data.get("organik"))
-    anorganik = persen_ke_int(data.get("anorganik"))
-    b3 = persen_ke_int(data.get("b3"))
-
-    c.execute("""
-        INSERT INTO data_tongsampah
-        (tong_id, organik, anorganik, b3, timestamp, waktu)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        tong_id,
-        organik,
-        anorganik,
-        b3,
-        data.get("timestamp"),
-        data.get("waktu")
-    ))
-
-    conn.commit()
-    conn.close()
-
-    print(f"✅ LOG | Tong {tong_id} | O:{organik}% A:{anorganik}% B3:{b3}%")
-
-# ======================
-# LOGGER 10 DETIK
-# ======================
-def logger_10_detik():
-    print("🚀 LOGGER AKTIF (10 DETIK)")
-    while True:
-        for tong, tong_id in TONG_MAP.items():
-            data = db.reference(tong).get()
-            if data:
-                simpan_ke_db(tong_id, data)
-        time.sleep(60)
-
-# ======================
-# DASHBOARD
-# ======================
-@app.route("/")
-def index():
-    per_page = 10
-    page = int(request.args.get("page", 1))
-    offset = (page - 1) * per_page
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-
-    c.execute("SELECT COUNT(*) FROM data_tongsampah")
-    total_data = c.fetchone()[0]
-    total_pages = max(1, math.ceil(total_data / per_page))
-
-    c.execute("""
-        SELECT * FROM data_tongsampah
-        ORDER BY id ASC
-        LIMIT ? OFFSET ?
-    """, (per_page, offset))
-
-    rows = c.fetchall()
-    conn.close()
-
-    html = """
-    <html>
-    <head>
-        <title>Log Tongsampah</title>
-
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                background-color: #f1f8f4;
-                margin: 0;
-                padding: 0;
-            }
-
-            .container {
-                display: flex;
-                justify-content: center;
-                margin-top: 40px;
-            }
-
-            .card {
-                background: white;
-                padding: 20px;
-                border-radius: 10px;
-                box-shadow: 0 4px 10px rgba(0,0,0,0.1);
-                width: 90%;
-                max-width: 1100px;
-            }
-
-            h2 {
-                text-align: center;
-                color: #1b5e20;
-            }
-
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin-top: 15px;
-            }
-
-            th {
-                background-color: #2e7d32;
-                color: white;
-                padding: 10px;
-            }
-
-            td {
-                padding: 8px;
-                text-align: center;
-                border-bottom: 1px solid #c8e6c9;
-            }
-
-            tr:nth-child(even) {
-                background-color: #e8f5e9;
-            }
-
-            tr:hover {
-                background-color: #c8e6c9;
-            }
-
-            .pagination {
-                text-align: center;
-                margin-top: 15px;
-            }
-
-            .pagination a {
-                padding: 6px 14px;
-                margin: 0 5px;
-                background-color: #2e7d32;
-                color: white;
-                text-decoration: none;
-                border-radius: 4px;
-            }
-
-            .pagination a:hover {
-                background-color: #1b5e20;
-            }
-        </style>
-
-        <script>
-            setTimeout(() => {
-                location.reload();
-            }, 5000);
-        </script>
-    </head>
-
-    <body>
-        <div class="container">
-            <div class="card">
-                <h2>LOG HISTORY TONG SAMPAH</h2>
-                <p style="text-align:center;">
-                </p>
-
-                <table>
-                    <tr>
-                        <th>ID</th>
-                        <th>Tong</th>
-                        <th>Organik (%)</th>
-                        <th>Anorganik (%)</th>
-                        <th>B3 (%)</th>
-                        <th>Timestamp</th>
-                        <th>Waktu</th>
-                    </tr>
-                    {% for r in rows %}
-                    <tr>
-                        <td>{{ r.id }}</td>
-                        <td>{{ r.tong_id }}</td>
-                        <td>{{ r.organik }}%</td>
-                        <td>{{ r.anorganik }}%</td>
-                        <td>{{ r.b3 }}%</td>
-                        <td>{{ r.timestamp }}</td>
-                        <td>{{ r.waktu }}</td>
-                    </tr>
-                    {% endfor %}
-                </table>
-
-                <div class="pagination">
-                    {% if page > 1 %}
-                        <a href="/?page={{ page - 1 }}">⬅ Prev</a>
-                    {% endif %}
-
-                    Page {{ page }} / {{ total_pages }}
-
-                    {% if page < total_pages %}
-                        <a href="/?page={{ page + 1 }}">Next ➡</a>
-                    {% endif %}
-                </div>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-    return render_template_string(
-        html,
-        rows=rows,
-        page=page,
-        total_pages=total_pages
+# ===============================
+# SESSION STATE INIT
+# ===============================
+if "table" not in st.session_state:
+    st.session_state.table = pd.DataFrame(
+        columns=["tong_id", "organik", "anorganik", "b3", "waktu", "source"]
     )
 
-# ======================
-# START APP
-# ======================
-if __name__ == "__main__":
-    threading.Thread(target=logger_10_detik, daemon=True).start()
-    app.run(debug=False, use_reloader=False)
+if "last_hashes" not in st.session_state:
+    st.session_state.last_hashes = {}
+
+if "page" not in st.session_state:
+    st.session_state.page = 0
+
+# ===============================
+# BACA DATA BARU
+# ===============================
+new_rows = read_current_data()
+
+for row in new_rows:
+    h = row_hash(row)
+    key = row["source"]
+    if st.session_state.last_hashes.get(key) != h:
+        st.session_state.table = pd.concat(
+            [st.session_state.table, pd.DataFrame([row])],
+            ignore_index=True
+        )
+        st.session_state.last_hashes[key] = h
+
+# ===============================
+# TAMPILKAN TABEL DENGAN % DAN HEADER CENTER
+# ===============================
+df = st.session_state.table
+total_pages = max((len(df) - 1) // PAGE_SIZE + 1, 1)
+start = st.session_state.page * PAGE_SIZE
+end = start + PAGE_SIZE
+
+df_display = df.iloc[start:end][["tong_id", "organik", "anorganik", "b3", "waktu"]].copy()
+
+for col in ["organik", "anorganik", "b3"]:
+    df_display[col] = df_display[col].astype(str) + "%"
+
+st.markdown(
+    """
+    <style>
+    th {text-align:center !important;}
+    td {text-align:center !important;}
+    </style>
+    """, unsafe_allow_html=True
+)
+
+st.table(df_display)
+
+# ===============================
+# NAVIGASI PAGINATION
+# ===============================
+col1, col2, col3 = st.columns([1, 2, 1])
+
+with col1:
+    if st.button("⬅ Previous", disabled=st.session_state.page == 0):
+        st.session_state.page -= 1
+        st.experimental_rerun()
+
+with col3:
+    if st.button("Next ➡", disabled=st.session_state.page >= total_pages - 1):
+        st.session_state.page += 1
+        st.experimental_rerun()
+
+with col2:
+    st.markdown(
+        f"<p style='text-align:center'>Page {st.session_state.page + 1} of {total_pages}</p>",
+        unsafe_allow_html=True
+    )
+
+# ===============================
+# AUTO REFRESH (tanpa time.sleep)
+# ===============================
+st.experimental_set_query_params(dummy=st.experimental_get_query_params())
+st_autorefresh = st.experimental_rerun
