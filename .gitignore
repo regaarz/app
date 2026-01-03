@@ -1,0 +1,9 @@
+# Ignore Firebase service account
+serviceAccountKey.json
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore Streamlit cache (opsional)
+.streamlit/
